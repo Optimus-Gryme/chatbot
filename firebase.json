@@ -1,0 +1,20 @@
+{
+  "functions": {
+    "source": "backend",
+    "runtime": "nodejs18"
+  },
+  "hosting": {
+    "public": "frontend/huibook-frontend/dist",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ]
+  }
+}
