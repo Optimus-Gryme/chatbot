@@ -4,7 +4,7 @@ import { Link } from 'react-router-dom'; // Import Link
 import FullCalendar from '@fullcalendar/react';
 import dayGridPlugin from '@fullcalendar/daygrid';
 import interactionPlugin from "@fullcalendar/interaction"; // for dateClick and eventClick
-import { functions } from '../../firebaseConfig'; // Path to your firebaseConfig
+import { auth, functions } from '../../firebaseConfig'; // Path to your firebaseConfig, ensure auth is imported
 import { httpsCallable } from 'firebase/functions';
 
 // Import FullCalendar CSS (ensure paths are correct)
@@ -16,11 +16,19 @@ const getEventsCallable = httpsCallable(functions, 'getEvents');
 const createEventCallable = httpsCallable(functions, 'createEvent');
 const updateEventCallable = httpsCallable(functions, 'updateEvent');
 const deleteEventCallable = httpsCallable(functions, 'deleteEvent');
+const listFormSchemasCallable = httpsCallable(functions, 'listFormSchemas'); // Added for fetching forms
+const getGoogleCalendarAuthUrlCallable = httpsCallable(functions, 'getGoogleCalendarAuthUrl'); // For Google Calendar Auth
 
 function AdminDashboard() {
   const [events, setEvents] = useState([]);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalMode, setModalMode] = useState('create'); // 'create' or 'edit'
+  const [availableForms, setAvailableForms] = useState([]);
+  const [formFetchError, setFormFetchError] = useState(null);
+  
+  // Google Calendar connection state
+  const [isConnectingToGoogle, setIsConnectingToGoogle] = useState(false);
+  const [googleAuthError, setGoogleAuthError] = useState(null);
   
   // Form state for the modal
   const [currentEventId, setCurrentEventId] = useState(null);
@@ -28,6 +36,7 @@ function AdminDashboard() {
   const [startDate, setStartDate] = useState(''); // Use string for input type='datetime-local'
   const [endDate, setEndDate] = useState('');
   const [description, setDescription] = useState('');
+  const [selectedFormId, setSelectedFormId] = useState(''); // For the dropdown in the modal
   // Add other event fields as needed e.g. allDay
 
   const fetchEvents = useCallback(async () => {
@@ -51,39 +60,60 @@ function AdminDashboard() {
 
   useEffect(() => {
     fetchEvents();
-  }, [fetchEvents]);
+    
+    // Fetch available forms
+    const fetchFormsForAdmin = async () => {
+      setFormFetchError(null);
+      try {
+        const result = await listFormSchemasCallable();
+        setAvailableForms(result.data || []);
+      } catch (error) {
+        console.error("Error fetching available forms:", error);
+        setFormFetchError("Failed to load forms: " + error.message);
+      }
+    };
+    fetchFormsForAdmin();
+
+  }, [fetchEvents]); // fetchEvents is already memoized with useCallback
 
   const openModal = (mode, data = {}) => {
     setIsModalOpen(true);
     setModalMode(mode);
+    // Reset common fields
+    setTitle(data.title || '');
+    setDescription(data.description || '');
+    setSelectedFormId(data.formId || ''); // Set selected form if event has one
+
     if (mode === 'create') {
       setCurrentEventId(null);
-      setTitle('');
-      // data.dateStr might be passed from handleDateClick
-      setStartDate(data.dateStr ? data.dateStr + "T09:00" : ''); // Default time or use selected
-      setEndDate(data.dateStr ? data.dateStr + "T10:00" : '');
-      setDescription('');
+      // data.dateStr might be passed from handleDateClick for pre-filling date
+      const initialStartDate = data.dateStr ? data.dateStr + "T09:00" : new Date().toISOString().slice(0,16);
+      const initialEndDate = data.dateStr ? data.dateStr + "T10:00" : new Date(new Date(initialStartDate).getTime() + 60 * 60 * 1000).toISOString().slice(0,16); // 1 hour later
+      setStartDate(initialStartDate);
+      setEndDate(initialEndDate);
     } else if (mode === 'edit') {
       setCurrentEventId(data.id);
-      setTitle(data.title || '');
       // Ensure date format is compatible with datetime-local input
-      // FullCalendar event.start/end are Date objects
       const formatDateTimeLocal = (dateObj) => {
         if (!dateObj) return '';
         const d = new Date(dateObj);
-        // Adjust for timezone offset to display correctly in local time input
-        d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+        d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); // Adjust for local timezone
         return d.toISOString().slice(0, 16);
       };
       setStartDate(formatDateTimeLocal(data.start));
       setEndDate(formatDateTimeLocal(data.end));
-      setDescription(data.description || '');
     }
   };
 
   const closeModal = () => {
     setIsModalOpen(false);
-    // Reset form fields if desired
+    // Reset form fields to default if desired, or simply close
+    setTitle('');
+    setStartDate('');
+    setEndDate('');
+    setDescription('');
+    setSelectedFormId('');
+    setCurrentEventId(null);
   };
 
   const handleDateClick = (arg) => {
@@ -91,25 +121,26 @@ function AdminDashboard() {
   };
 
   const handleEventClick = (clickInfo) => {
-    // clickInfo.event contains the event object from FullCalendar
     openModal('edit', { 
       id: clickInfo.event.id, 
       title: clickInfo.event.title,
       start: clickInfo.event.start,
       end: clickInfo.event.end,
-      description: clickInfo.event.extendedProps.description // Custom props are in extendedProps
-      // allDay: clickInfo.event.allDay
+      description: clickInfo.event.extendedProps.description,
+      formId: clickInfo.event.extendedProps.formId // Pass formId from FullCalendar event
+      // allDay: clickInfo.event.allDay (if used)
     });
   };
   
   const handleSubmit = async (e) => {
     e.preventDefault();
-    const eventData = {
+    const eventPayload = {
       title,
-      start: new Date(startDate).toISOString(), // Convert to ISO string or Firebase Timestamp for backend
+      start: new Date(startDate).toISOString(),
       end: new Date(endDate).toISOString(),
       description,
-      // allDay, formId (if implemented)
+      formId: selectedFormId || null, // Add selectedFormId to the payload
+      // allDay: (if implemented)
     };
 
     try {
@@ -148,6 +179,18 @@ function AdminDashboard() {
       <h2>Admin Dashboard</h2>
       <Link to="/admin/forms">Manage Event Forms</Link>
       <hr style={{ margin: '20px 0' }}/>
+
+      <div style={{ marginBottom: '20px', padding: '10px', border: '1px solid #eee' }}>
+        <h4>Google Calendar Integration</h4>
+        <button onClick={handleConnectGoogleCalendar} disabled={isConnectingToGoogle}>
+          {isConnectingToGoogle ? "Connecting..." : "Connect to Google Calendar"}
+        </button>
+        {googleAuthError && <p style={{ color: 'red' }}>{googleAuthError}</p>}
+        <p style={{fontSize: '0.8em', color: 'gray'}}>
+            You will be redirected to Google to authorize access to your calendar.
+        </p>
+      </div>
+      
       <button onClick={() => openModal('create')}>Add New Event</button>
       <FullCalendar
         plugins={[dayGridPlugin, interactionPlugin]}
@@ -179,6 +222,18 @@ function AdminDashboard() {
             <div>
               <label htmlFor="eventDescription">Description:</label>
               <textarea id="eventDescription" value={description} onChange={(e) => setDescription(e.target.value)}></textarea>
+            </div>
+            <div>
+              <label htmlFor="eventForm">Associated Form (Optional):</label>
+              <select id="eventForm" value={selectedFormId} onChange={(e) => setSelectedFormId(e.target.value)}>
+                <option value="">-- None --</option>
+                {availableForms.map(form => (
+                  <option key={form.id} value={form.id}>
+                    {form.formName} (Fields: {form.fieldCount !== undefined ? form.fieldCount : 'N/A'})
+                  </option>
+                ))}
+              </select>
+              {formFetchError && <p style={{color: 'red', fontSize: '0.8em'}}>{formFetchError}</p>}
             </div>
             <button type="submit">{modalMode === 'create' ? 'Create' : 'Save Changes'}</button>
             <button type="button" onClick={closeModal}>Cancel</button>
